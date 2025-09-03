@@ -120,12 +120,6 @@ io.on("connection", (socket) => {
 
     const playerIds = Object.keys(game.players ?? {});
 
-    // ensure all players are ready
-    const allReady = playerIds.every(id => game.players[id]?.ready);
-    if (!allReady) {
-      socket.emit("errorMsg", "All players must be ready before starting.");
-      return;
-    }
     const roles = assignRoles(playerIds.length);
 
     playerIds.forEach((id, index) => {
