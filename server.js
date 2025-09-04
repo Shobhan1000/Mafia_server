@@ -97,7 +97,7 @@ io.on("connection", (socket) => {
     io.to(rId).emit("hostAssigned", { hostId: games[rId].hostId });
     emitLobbyUpdate(rId);
 
-    callback?.({ success: true, playerId: pId });
+    callback?.({ success: true, playerId: pId, roomId: rId });
   });
 
   // --- Join Room ---
@@ -216,7 +216,7 @@ io.on("connection", (socket) => {
       }
     }
   });
-  
+
   // --- Night & Day Logic (unchanged except for playerId adaptation) ---
   socket.on("nightAction", ({ roomId, playerId, actionType, targetId }) => {
     const rId = safeRoomId(roomId);
