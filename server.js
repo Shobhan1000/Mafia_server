@@ -58,11 +58,11 @@ io.on("connection", (socket) => {
   console.log("New client connected:", socket.id);
 
   // --- Create Room ---
-  socket.on("createRoom", ({ roomId, name }) => {
+  socket.on("createRoom", ({ roomId, name }, callback) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const safeName = String(name || "Player").trim() || "Player";
 
-    if (!safeName) return socket.emit("errorMsg", "Name is required");
+    if (!safeName) return callback?.({ success: false, message: "Name is required" });
 
     if (!games[safeRoom]) {
       games[safeRoom] = {
@@ -85,20 +85,22 @@ io.on("connection", (socket) => {
     socket.join(safeRoom);
 
     io.to(safeRoom).emit("hostAssigned", { hostId: games[safeRoom].hostId });
-    console.log(`[Room ${safeRoom}] Host assigned: ${games[safeRoom].hostId}`);
-
     io.to(safeRoom).emit("lobbyUpdate", {
       players: games[safeRoom].players ?? {},
       hostId: games[safeRoom].hostId ?? null,
     });
+
+    callback?.({ success: true });
   });
 
+
   // --- Join Room ---
-  socket.on("joinRoom", ({ roomId, name }) => {
+  socket.on("joinRoom", ({ roomId, name }, callback) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const safeName = String(name || "Player").trim() || "Player";
     const game = games[safeRoom];
-    if (!game) return socket.emit("errorMsg", "Room not found");
+
+    if (!game) return callback?.({ success: false, message: "Room not found" });
 
     game.players[socket.id] = {
       id: socket.id,
@@ -109,13 +111,13 @@ io.on("connection", (socket) => {
     };
     socket.join(safeRoom);
 
-    console.log(`[Room ${safeRoom}] ${safeName} joined (${socket.id})`);
-
     io.to(safeRoom).emit("hostAssigned", { hostId: game.hostId });
     io.to(safeRoom).emit("lobbyUpdate", {
       players: game.players ?? {},
       hostId: game.hostId ?? null,
     });
+
+    callback?.({ success: true });
   });
 
   // --- Player Ready Toggle ---
