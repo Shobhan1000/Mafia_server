@@ -204,7 +204,7 @@ io.on("connection", (socket) => {
     Object.keys(games).forEach((roomId) => handleLeave(roomId));
   });
 
-  // --- Night & Day Logic (same as before) ---
+  // --- Night & Day Logic (unchanged) ---
   socket.on("nightAction", ({ roomId, actionType, targetId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
