@@ -81,6 +81,9 @@ io.on("connection", (socket) => {
     };
     socket.join(safeRoom);
 
+    // Notify everyone who the host is
+    io.to(safeRoom).emit("hostAssigned", { hostId: games[safeRoom].hostId });
+
     io.to(safeRoom).emit("lobbyUpdate", {
       players: games[safeRoom].players ?? {},
       hostId: games[safeRoom].hostId ?? null,
@@ -102,6 +105,9 @@ io.on("connection", (socket) => {
       ready: false,
     };
     socket.join(safeRoom);
+
+    // Notify everyone who the host is
+    io.to(safeRoom).emit("hostAssigned", { hostId: game.hostId });
 
     io.to(safeRoom).emit("lobbyUpdate", {
       players: game.players ?? {},
@@ -133,7 +139,8 @@ io.on("connection", (socket) => {
 
     const playersList = Object.values(game.players ?? {});
     const minPlayers = 3;
-    const allReady = playersList.length >= minPlayers && playersList.every(p => p.ready);
+    const allReady =
+      playersList.length >= minPlayers && playersList.every((p) => p.ready);
 
     if (!allReady)
       return socket.emit(
@@ -173,6 +180,11 @@ io.on("connection", (socket) => {
     if (wasHost) {
       const remaining = Object.keys(game.players ?? {});
       game.hostId = remaining.length ? remaining[0] : null;
+
+      // Reassign host
+      if (game.hostId) {
+        io.to(roomId).emit("hostAssigned", { hostId: game.hostId });
+      }
     }
 
     if (Object.keys(game.players ?? {}).length === 0) {
@@ -185,12 +197,14 @@ io.on("connection", (socket) => {
     }
   }
 
-  socket.on("leaveLobby", ({ roomId }) => handleLeave(String(roomId).toUpperCase()));
+  socket.on("leaveLobby", ({ roomId }) =>
+    handleLeave(String(roomId).toUpperCase())
+  );
   socket.on("disconnect", () => {
-    Object.keys(games).forEach(roomId => handleLeave(roomId));
+    Object.keys(games).forEach((roomId) => handleLeave(roomId));
   });
 
-  // --- Night & Day Logic (unchanged from your version) ---
+  // --- Night & Day Logic (same as before) ---
   socket.on("nightAction", ({ roomId, actionType, targetId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
@@ -254,11 +268,14 @@ io.on("connection", (socket) => {
     });
 
     const totalVotes = Object.values(game.votes).reduce((a, b) => a + b, 0);
-    const aliveCount = Object.values(game.players ?? {}).filter(p => p.alive).length;
+    const aliveCount = Object.values(game.players ?? {}).filter((p) => p.alive)
+      .length;
 
     if (aliveCount > 0 && totalVotes >= aliveCount) {
       const maxVotes = Math.max(...Object.values(game.votes));
-      const eliminatedId = Object.keys(game.votes).find(id => game.votes[id] === maxVotes);
+      const eliminatedId = Object.keys(game.votes).find(
+        (id) => game.votes[id] === maxVotes
+      );
       if (eliminatedId && game.players[eliminatedId]) {
         game.players[eliminatedId].alive = false;
         io.to(safeRoom).emit("playerEliminated", {
