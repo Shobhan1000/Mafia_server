@@ -27,6 +27,7 @@ function checkWinConditions(game, roomId) {
   const villagersAlive = alivePlayers.length - mafiaAlive;
 
   if (mafiaAlive === 0) {
+    console.log(`[Room ${roomId}] Villagers win!`);
     io.to(roomId).emit("gameOver", { winner: "Villagers" });
     io.to(roomId).emit("revealRoles", {
       roles: Object.fromEntries(
@@ -38,6 +39,7 @@ function checkWinConditions(game, roomId) {
     });
     game.status = "finished";
   } else if (mafiaAlive >= villagersAlive) {
+    console.log(`[Room ${roomId}] Mafia win!`);
     io.to(roomId).emit("gameOver", { winner: "Mafia" });
     io.to(roomId).emit("revealRoles", {
       roles: Object.fromEntries(
@@ -70,6 +72,7 @@ io.on("connection", (socket) => {
         nightActions: {},
         hostId: socket.id,
       };
+      console.log(`[Room ${safeRoom}] created by ${safeName} (${socket.id})`);
     }
 
     games[safeRoom].players[socket.id] = {
@@ -81,8 +84,8 @@ io.on("connection", (socket) => {
     };
     socket.join(safeRoom);
 
-    // Notify everyone who the host is
     io.to(safeRoom).emit("hostAssigned", { hostId: games[safeRoom].hostId });
+    console.log(`[Room ${safeRoom}] Host assigned: ${games[safeRoom].hostId}`);
 
     io.to(safeRoom).emit("lobbyUpdate", {
       players: games[safeRoom].players ?? {},
@@ -106,9 +109,9 @@ io.on("connection", (socket) => {
     };
     socket.join(safeRoom);
 
-    // Notify everyone who the host is
-    io.to(safeRoom).emit("hostAssigned", { hostId: game.hostId });
+    console.log(`[Room ${safeRoom}] ${safeName} joined (${socket.id})`);
 
+    io.to(safeRoom).emit("hostAssigned", { hostId: game.hostId });
     io.to(safeRoom).emit("lobbyUpdate", {
       players: game.players ?? {},
       hostId: game.hostId ?? null,
@@ -122,6 +125,11 @@ io.on("connection", (socket) => {
     if (!game || !game.players[socket.id]) return;
 
     game.players[socket.id].ready = !!ready;
+    console.log(
+      `[Room ${safeRoom}] ${game.players[socket.id].name} is now ${
+        ready ? "READY" : "NOT ready"
+      }`
+    );
 
     io.to(safeRoom).emit("lobbyUpdate", {
       players: game.players ?? {},
@@ -129,7 +137,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // --- Start Game (Only Host & Min Players & All Ready) ---
+  // --- Start Game ---
   socket.on("startGame", ({ roomId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
@@ -148,12 +156,17 @@ io.on("connection", (socket) => {
         `Need at least ${minPlayers} players and everyone ready`
       );
 
+    console.log(`[Room ${safeRoom}] Game started`);
+
     // Assign roles
     const ids = Object.keys(game.players);
     const roles = assignRoles(ids.length);
     ids.forEach((id, idx) => {
       game.players[id].role = roles[idx];
       game.players[id].alive = true;
+      console.log(
+        `[Room ${safeRoom}] ${game.players[id].name} is ${game.players[id].role}`
+      );
     });
     game.status = "night";
     game.phase = "night";
@@ -174,20 +187,24 @@ io.on("connection", (socket) => {
     if (!game) return;
 
     const wasHost = game.hostId === socket.id;
-    if (game.players?.[socket.id]) delete game.players[socket.id];
+    if (game.players?.[socket.id]) {
+      console.log(`[Room ${roomId}] ${game.players[socket.id].name} left`);
+      delete game.players[socket.id];
+    }
     socket.leave(roomId);
 
     if (wasHost) {
       const remaining = Object.keys(game.players ?? {});
       game.hostId = remaining.length ? remaining[0] : null;
 
-      // Reassign host
       if (game.hostId) {
+        console.log(`[Room ${roomId}] New host: ${game.hostId}`);
         io.to(roomId).emit("hostAssigned", { hostId: game.hostId });
       }
     }
 
     if (Object.keys(game.players ?? {}).length === 0) {
+      console.log(`[Room ${roomId}] Empty — deleting room`);
       delete games[roomId];
     } else {
       io.to(roomId).emit("lobbyUpdate", {
@@ -201,16 +218,18 @@ io.on("connection", (socket) => {
     handleLeave(String(roomId).toUpperCase())
   );
   socket.on("disconnect", () => {
+    console.log(`Client disconnected: ${socket.id}`);
     Object.keys(games).forEach((roomId) => handleLeave(roomId));
   });
 
-  // --- Night & Day Logic (unchanged) ---
+  // --- Night & Day Logic (unchanged, but add some logs) ---
   socket.on("nightAction", ({ roomId, actionType, targetId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
     if (!game || game.phase !== "night") return;
 
     if (!game.nightActions) game.nightActions = {};
+    console.log(`[Room ${safeRoom}] ${actionType} action on ${targetId}`);
 
     const at = (actionType || "").toString().toLowerCase();
     if (at === "kill" || at === "mafia") game.nightActions.mafiaVictim = targetId;
@@ -224,6 +243,7 @@ io.on("connection", (socket) => {
 
       if (victim && victim !== saved && game.players[victim]) {
         game.players[victim].alive = false;
+        console.log(`[Room ${safeRoom}] ${game.players[victim].name} was killed`);
         io.to(safeRoom).emit("playerEliminated", {
           playerId: victim,
           name: game.players[victim].name,
@@ -237,6 +257,9 @@ io.on("connection", (socket) => {
           (id) => game.players[id].role === "Detective"
         );
         if (detectiveId && game.players[checkedId]) {
+          console.log(
+            `[Room ${safeRoom}] Detective checked ${game.players[checkedId].name}`
+          );
           io.to(detectiveId).emit("detectiveResult", {
             playerId: checkedId,
             role: game.players[checkedId].role,
@@ -246,6 +269,7 @@ io.on("connection", (socket) => {
 
       game.phase = "day";
       game.nightActions = {};
+      console.log(`[Room ${safeRoom}] Phase change: DAY`);
       io.to(safeRoom).emit("phaseChange", { phase: "day" });
 
       checkWinConditions(game, safeRoom);
@@ -259,6 +283,8 @@ io.on("connection", (socket) => {
 
     if (!game.votes) game.votes = {};
     if (votedId) game.votes[votedId] = (game.votes[votedId] || 0) + 1;
+
+    console.log(`[Room ${safeRoom}] Vote cast on ${votedId}`);
 
     io.to(safeRoom).emit("voteUpdate", {
       votes: game.votes,
@@ -278,6 +304,9 @@ io.on("connection", (socket) => {
       );
       if (eliminatedId && game.players[eliminatedId]) {
         game.players[eliminatedId].alive = false;
+        console.log(
+          `[Room ${safeRoom}] ${game.players[eliminatedId].name} was voted out`
+        );
         io.to(safeRoom).emit("playerEliminated", {
           playerId: eliminatedId,
           name: game.players[eliminatedId].name,
@@ -287,6 +316,7 @@ io.on("connection", (socket) => {
 
       game.votes = {};
       game.phase = "night";
+      console.log(`[Room ${safeRoom}] Phase change: NIGHT`);
       io.to(safeRoom).emit("phaseChange", { phase: "night" });
 
       checkWinConditions(game, safeRoom);
