@@ -92,7 +92,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // --- Join Room (existing name) ---
+  // --- Join Room ---
   socket.on("joinRoom", ({ roomId, name }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const safeName = String(name || "Player").trim() || "Player";
@@ -125,9 +125,8 @@ io.on("connection", (socket) => {
   });
 
   // --- Join Lobby (alias) ---
-  // Some clients emit "joinLobby" — support both names
   socket.on("joinLobby", ({ roomId, name }) => {
-    const safeRoom = String(roomId || "").toUpperCase();
+    const safeRoom = String(roomId || "").toUpperCase(); // ✅ fixed order
     const safeName = String(name || "Player").trim() || "Player";
 
     const game = games[safeRoom];
@@ -157,59 +156,91 @@ io.on("connection", (socket) => {
     });
   });
 
+  // --- Leave Lobby ---
+  socket.on("leaveLobby", ({ roomId }) => {
+    const safeRoom = String(roomId || "").toUpperCase();
+    const game = games[safeRoom];
+    if (!game) return;
+
+    const wasHost = game.hostId === socket.id;
+    if (game.players && game.players[socket.id]) {
+      delete game.players[socket.id];
+    }
+    socket.leave(safeRoom);
+
+    if (wasHost) {
+      const remaining = Object.keys(game.players || {});
+      game.hostId = remaining.length ? remaining[0] : null;
+    }
+    if (Object.keys(game.players || {}).length === 0) {
+      delete games[safeRoom];
+    } else {
+      io.to(safeRoom).emit("lobbyUpdate", {
+        players: game.players || {},
+        hostId: game.hostId || null,
+      });
+    }
+  });
+
   // --- Player Ready ---
   socket.on("playerReady", ({ roomId, ready }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
-    if (!game || !game.players || !game.players[socket.id]) return;
+    if (!game) return;
+    if (!game.players[socket.id]) return;
+
     game.players[socket.id].ready = !!ready;
 
-    console.log(
-      `Player ready update in ${safeRoom}: ${game.players[socket.id].name} -> ${!!ready}`
-    );
-
     io.to(safeRoom).emit("lobbyUpdate", {
-      players: game.players ?? {},
-      hostId: game.hostId ?? null,
+      players: game.players || {},
+      hostId: game.hostId || null,
     });
   });
 
-  // --- Start Game & Assign Roles (Only Host) ---
+  // --- Start Game (only host) ---
   socket.on("startGame", ({ roomId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
-    if (!game) return;
+    if (!game) {
+      socket.emit("errorMsg", "Room not found");
+      return;
+    }
 
     if (game.hostId !== socket.id) {
       socket.emit("errorMsg", "Only the host can start the game");
       return;
     }
 
-    const playerIds = Object.keys(game.players ?? {});
-    if (playerIds.length === 0) return;
+    const pList = Object.values(game.players || {});
+    const minPlayers = 3;
+    const allReady = pList.length >= minPlayers && pList.every((p) => p.ready);
+    if (!allReady) {
+      socket.emit(
+        "errorMsg",
+        `Need at least ${minPlayers} players and everyone ready`
+      );
+      return;
+    }
 
-    const roles = assignRoles(playerIds.length);
+    // Assign roles
+    const ids = Object.keys(game.players);
+    const roles = assignRoles(ids.length);
 
-    playerIds.forEach((id, index) => {
-      game.players[id].role = roles[index];
-      io.to(id).emit("roleAssigned", game.players[id].role);
+    ids.forEach((id, idx) => {
+      game.players[id].role = roles[idx];
+      game.players[id].alive = true;
     });
 
-    // notify mafia with list of other mafia
-    const mafiaIds = playerIds.filter((id) => game.players[id].role === "Mafia");
-    mafiaIds.forEach((id) => {
-      const others = mafiaIds
-        .filter((mid) => mid !== id)
-        .map((mid) => ({ id: mid, name: game.players[mid].name }));
-      io.to(id).emit("mafiaMembers", others);
-    });
-
-    game.status = "inProgress";
+    game.status = "night";
     game.phase = "night";
-    game.nightActions = {};
-    console.log(`Game started in ${safeRoom}`);
-    io.to(safeRoom).emit("gameStarted", game.players ?? {});
-    io.to(safeRoom).emit("phaseChange", { phase: "night" });
+
+    ids.forEach((id) => {
+      io.to(id).emit("gameStarted", {
+        roomId: safeRoom,
+        role: game.players[id].role,
+      });
+    });
+    io.to(safeRoom).emit("nightBegins");
   });
 
   // --- Night Actions ---
@@ -220,13 +251,12 @@ io.on("connection", (socket) => {
 
     if (!game.nightActions) game.nightActions = {};
 
-    // Accept multiple naming conventions (client might send "kill"/"save"/"investigate" or "mafia"/"doctor"/"detective")
     const at = (actionType || "").toString().toLowerCase();
     if (at === "kill" || at === "mafia") game.nightActions.mafiaVictim = targetId;
     if (at === "save" || at === "doctor") game.nightActions.doctorSave = targetId;
-    if (at === "investigate" || at === "detective") game.nightActions.detectiveCheck = targetId;
+    if (at === "investigate" || at === "detective")
+      game.nightActions.detectiveCheck = targetId;
 
-    // Only proceed to resolve when mafia target is set (simple single-action gating)
     if (game.nightActions.mafiaVictim) {
       const victim = game.nightActions.mafiaVictim;
       const saved = game.nightActions.doctorSave;
@@ -238,7 +268,6 @@ io.on("connection", (socket) => {
           name: game.players[victim].name,
           role: game.players[victim].role,
         });
-        console.log(`Night elimination in ${safeRoom}: ${game.players[victim].name} (${game.players[victim].role})`);
       }
 
       if (game.nightActions.detectiveCheck) {
@@ -252,7 +281,6 @@ io.on("connection", (socket) => {
             playerId: checkedId,
             role: roleChecked,
           });
-          console.log(`Detective result in ${safeRoom}: ${game.players[checkedId].name} -> ${roleChecked}`);
         }
       }
 
@@ -283,7 +311,8 @@ io.on("connection", (socket) => {
     });
 
     const totalVotes = Object.values(game.votes).reduce((a, b) => a + b, 0);
-    const aliveCount = Object.values(game.players ?? {}).filter((p) => p.alive).length;
+    const aliveCount = Object.values(game.players ?? {}).filter((p) => p.alive)
+      .length;
 
     if (aliveCount > 0 && totalVotes >= aliveCount) {
       const maxVotes = Math.max(...Object.values(game.votes));
@@ -297,7 +326,6 @@ io.on("connection", (socket) => {
           name: game.players[eliminatedId].name,
           role: game.players[eliminatedId].role,
         });
-        console.log(`Day elimination in ${safeRoom}: ${game.players[eliminatedId].name} (${game.players[eliminatedId].role})`);
       }
 
       game.votes = {};
@@ -312,7 +340,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     for (const [roomId, game] of Object.entries(games)) {
       if (game.players?.[socket.id]) {
-        console.log(`Player disconnected: ${game.players[socket.id].name} from ${roomId}`);
+        console.log(
+          `Player disconnected: ${game.players[socket.id].name} from ${roomId}`
+        );
         delete game.players[socket.id];
 
         if (game.hostId === socket.id) {
