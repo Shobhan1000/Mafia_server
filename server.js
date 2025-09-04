@@ -71,7 +71,7 @@ io.on("connection", (socket) => {
         status: "waiting",
         phase: null,
         nightActions: {},
-        hostId: socket.id,
+        hostId: socket.id, // creator is always host
       };
     }
 
@@ -84,7 +84,9 @@ io.on("connection", (socket) => {
     };
     socket.join(safeRoom);
 
-    console.log(`Room created/joined: ${safeRoom} by ${safeName} (${socket.id})`);
+    console.log(
+      `Room created/joined: ${safeRoom} by ${safeName} (${socket.id})`
+    );
 
     io.to(safeRoom).emit("lobbyUpdate", {
       players: games[safeRoom].players ?? {},
@@ -92,7 +94,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // --- Join Room ---
+  // --- Join Room (explicit join) ---
   socket.on("joinRoom", ({ roomId, name }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const safeName = String(name || "Player").trim() || "Player";
@@ -124,18 +126,18 @@ io.on("connection", (socket) => {
     });
   });
 
-  // --- Join Lobby (alias) ---
+  // --- Join Lobby (alias of joinRoom) ---
   socket.on("joinLobby", ({ roomId, name }) => {
-    const safeRoom = String(roomId || "").toUpperCase(); // ✅ fixed order
+    const safeRoom = String(roomId || "").toUpperCase();
     const safeName = String(name || "Player").trim() || "Player";
 
     const game = games[safeRoom];
-    if (!safeName) {
-      socket.emit("errorMsg", "Name is required to join a room");
-      return;
-    }
     if (!game) {
       socket.emit("errorMsg", "Room not found");
+      return;
+    }
+    if (!safeName) {
+      socket.emit("errorMsg", "Name is required to join a room");
       return;
     }
 
@@ -168,6 +170,7 @@ io.on("connection", (socket) => {
     }
     socket.leave(safeRoom);
 
+    // choose new host if needed
     if (wasHost) {
       const remaining = Object.keys(game.players || {});
       game.hostId = remaining.length ? remaining[0] : null;
@@ -197,7 +200,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // --- Start Game (only host) ---
+  // --- Start Game & Assign Roles (Only Host) ---
   socket.on("startGame", ({ roomId }) => {
     const safeRoom = String(roomId || "").toUpperCase();
     const game = games[safeRoom];
@@ -210,10 +213,10 @@ io.on("connection", (socket) => {
       socket.emit("errorMsg", "Only the host can start the game");
       return;
     }
-
     const pList = Object.values(game.players || {});
     const minPlayers = 3;
-    const allReady = pList.length >= minPlayers && pList.every((p) => p.ready);
+    const allReady =
+      pList.length >= minPlayers && pList.every((p) => p.ready);
     if (!allReady) {
       socket.emit(
         "errorMsg",
@@ -222,7 +225,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Assign roles
+    // assign roles and start
     const ids = Object.keys(game.players);
     const roles = assignRoles(ids.length);
 
@@ -230,7 +233,6 @@ io.on("connection", (socket) => {
       game.players[id].role = roles[idx];
       game.players[id].alive = true;
     });
-
     game.status = "night";
     game.phase = "night";
 
@@ -268,6 +270,9 @@ io.on("connection", (socket) => {
           name: game.players[victim].name,
           role: game.players[victim].role,
         });
+        console.log(
+          `Night elimination in ${safeRoom}: ${game.players[victim].name} (${game.players[victim].role})`
+        );
       }
 
       if (game.nightActions.detectiveCheck) {
@@ -281,6 +286,9 @@ io.on("connection", (socket) => {
             playerId: checkedId,
             role: roleChecked,
           });
+          console.log(
+            `Detective result in ${safeRoom}: ${game.players[checkedId].name} -> ${roleChecked}`
+          );
         }
       }
 
@@ -311,8 +319,9 @@ io.on("connection", (socket) => {
     });
 
     const totalVotes = Object.values(game.votes).reduce((a, b) => a + b, 0);
-    const aliveCount = Object.values(game.players ?? {}).filter((p) => p.alive)
-      .length;
+    const aliveCount = Object.values(game.players ?? {}).filter(
+      (p) => p.alive
+    ).length;
 
     if (aliveCount > 0 && totalVotes >= aliveCount) {
       const maxVotes = Math.max(...Object.values(game.votes));
@@ -326,6 +335,9 @@ io.on("connection", (socket) => {
           name: game.players[eliminatedId].name,
           role: game.players[eliminatedId].role,
         });
+        console.log(
+          `Day elimination in ${safeRoom}: ${game.players[eliminatedId].name} (${game.players[eliminatedId].role})`
+        );
       }
 
       game.votes = {};
