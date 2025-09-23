@@ -1,0 +1,1 @@
+This is the backend for the Mafia Party Game App
