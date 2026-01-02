@@ -13,9 +13,9 @@ const io = new Server(server, {
 });
 
 const games = {};
-const ROLE_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const ROOM_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 
-// Role configuration with emojis (can be replaced with image URLs)
+// Role configuration with emojis
 const ROLE_CONFIG = {
   Mafia: {
     emoji: "🕶️",
@@ -60,30 +60,83 @@ function emitLobbyUpdate(roomId) {
   
   io.to(roomId).emit("lobbyUpdate", {
     players: game.players,
-    hostId: game.hostId
+    hostId: game.hostId,
+    roleSettings: game.roleSettings || getDefaultRoleSettings()
   });
 }
 
-function assignRoles(playerCount) {
+function getDefaultRoleSettings() {
+  return {
+    mafiaCount: 1,
+    detectiveCount: 1,
+    doctorCount: 1,
+    villagerCount: 1 // This will be auto-calculated based on player count
+  };
+}
+
+function assignRoles(game, roomId) {
+  const playerIds = Object.keys(game.players);
+  const playerCount = playerIds.length;
+  
+  // Get role settings or use defaults
+  const settings = game.roleSettings || getDefaultRoleSettings();
+  
   const roles = [];
-  const mafiaCount = Math.max(1, Math.floor(playerCount / 4));
   
   // Add Mafia
-  for (let i = 0; i < mafiaCount; i++) {
+  for (let i = 0; i < Math.min(settings.mafiaCount, playerCount); i++) {
     roles.push("Mafia");
   }
   
-  // Add special roles
-  roles.push("Detective");
-  roles.push("Doctor");
+  // Add Detective
+  for (let i = 0; i < Math.min(settings.detectiveCount, playerCount - roles.length); i++) {
+    roles.push("Detective");
+  }
+  
+  // Add Doctor
+  for (let i = 0; i < Math.min(settings.doctorCount, playerCount - roles.length); i++) {
+    roles.push("Doctor");
+  }
   
   // Fill remaining with Villagers
   while (roles.length < playerCount) {
     roles.push("Villager");
   }
   
+  // If we have too many roles (shouldn't happen with proper validation), trim
+  if (roles.length > playerCount) {
+    roles.length = playerCount;
+  }
+  
   // Shuffle roles
   return roles.sort(() => Math.random() - 0.5);
+}
+
+function validateRoleSettings(settings, playerCount) {
+  const totalRequested = settings.mafiaCount + settings.detectiveCount + settings.doctorCount;
+  
+  if (totalRequested > playerCount) {
+    return {
+      valid: false,
+      message: `Too many special roles requested. You have ${playerCount} players but requested ${totalRequested} special roles.`
+    };
+  }
+  
+  if (settings.mafiaCount < 1) {
+    return {
+      valid: false,
+      message: "You need at least 1 Mafia member."
+    };
+  }
+  
+  if (settings.detectiveCount < 0 || settings.doctorCount < 0) {
+    return {
+      valid: false,
+      message: "Role counts cannot be negative."
+    };
+  }
+  
+  return { valid: true };
 }
 
 function checkWinConditions(game, roomId) {
@@ -127,7 +180,6 @@ function checkWinConditions(game, roomId) {
 io.on("connection", (socket) => {
   console.log(`✅ New client connected: ${socket.id}`);
   
-  // Store connection data
   socket.data.connectionTime = Date.now();
 
   // --- CREATE or JOIN ROOM ---
@@ -150,14 +202,15 @@ io.on("connection", (socket) => {
         votes: {},
         hostId: pId,
         lastActive: Date.now(),
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        roleSettings: getDefaultRoleSettings()
       };
       console.log(`[Room ${rId}] 🆕 Created by ${pName} (${pId})`);
     }
 
     const game = games[rId];
     
-    // Check if player already exists (by socket.id or playerId)
+    // Check if player already exists (by socket.id)
     let existingPlayerId = null;
     Object.entries(game.players).forEach(([pid, player]) => {
       if (player.socketId === socket.id) {
@@ -168,7 +221,13 @@ io.on("connection", (socket) => {
     if (existingPlayerId) {
       // Player reconnecting - update socket ID
       game.players[existingPlayerId].socketId = socket.id;
-      console.log(`[Room ${rId}] 🔄 ${pName} reconnected`);
+      game.players[existingPlayerId].name = pName;
+      console.log(`[Room ${rId}] 🔄 ${game.players[existingPlayerId].name} reconnected`);
+    } else if (game.players[pId]) {
+      // Player reconnecting with stored ID
+      game.players[pId].socketId = socket.id;
+      game.players[pId].name = pName;
+      console.log(`[Room ${rId}] 🔄 ${pName} reconnected with stored ID`);
     } else {
       // New player joining
       game.players[pId] = {
@@ -186,19 +245,60 @@ io.on("connection", (socket) => {
     // Join socket room
     socket.join(rId);
     socket.data.roomId = rId;
-    socket.data.playerId = existingPlayerId || pId;
+    socket.data.playerId = pId;
     
     game.lastActive = Date.now();
 
     callback?.({ 
       success: true, 
-      playerId: existingPlayerId || pId, 
+      playerId: pId, 
       roomId: rId,
-      hostId: game.hostId
+      hostId: game.hostId,
+      roleSettings: game.roleSettings
     });
 
     // Broadcast updated lobby state
     emitLobbyUpdate(rId);
+  });
+
+  // --- UPDATE ROLE SETTINGS (HOST ONLY) ---
+  socket.on("updateRoleSettings", ({ roomId, playerId, roleSettings }, callback) => {
+    const rId = safeRoomId(roomId);
+    const game = games[rId];
+    
+    if (!game) {
+      return callback?.({ success: false, message: "Room not found" });
+    }
+    
+    // Check if sender is host
+    if (game.hostId !== playerId) {
+      return callback?.({ success: false, message: "Only the host can update role settings" });
+    }
+    
+    // Validate role settings
+    const playerCount = Object.keys(game.players).length;
+    const validation = validateRoleSettings(roleSettings, playerCount);
+    
+    if (!validation.valid) {
+      return callback?.({ success: false, message: validation.message });
+    }
+    
+    // Update role settings
+    game.roleSettings = {
+      mafiaCount: Math.max(1, roleSettings.mafiaCount || 1),
+      detectiveCount: Math.max(0, roleSettings.detectiveCount || 1),
+      doctorCount: Math.max(0, roleSettings.doctorCount || 1),
+      villagerCount: Math.max(0, roleSettings.villagerCount || 1)
+    };
+    
+    game.lastActive = Date.now();
+    
+    console.log(`[Room ${rId}] ⚙️ Host updated role settings:`, game.roleSettings);
+    
+    // Broadcast updated settings to all players
+    emitLobbyUpdate(rId);
+    
+    callback?.({ success: true, roleSettings: game.roleSettings });
   });
 
   // --- PLAYER READY TOGGLE ---
@@ -211,14 +311,12 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Update ready status
     const wasReady = game.players[playerId].ready;
     game.players[playerId].ready = Boolean(ready);
     game.lastActive = Date.now();
     
     console.log(`[Room ${rId}] ${game.players[playerId].name} ${wasReady ? 'unready' : 'ready'} → ${ready ? 'READY ✅' : 'NOT READY ❌'}`);
     
-    // Broadcast update
     emitLobbyUpdate(rId);
   });
 
@@ -232,7 +330,6 @@ io.on("connection", (socket) => {
       return;
     }
     
-    // Check if sender is host
     if (game.hostId !== playerId) {
       socket.emit("errorMsg", "Only the host can start the game");
       return;
@@ -241,7 +338,6 @@ io.on("connection", (socket) => {
     const playersList = Object.values(game.players);
     const minPlayers = 3;
     
-    // Validation checks
     if (playersList.length < minPlayers) {
       socket.emit("errorMsg", `Need at least ${minPlayers} players to start`);
       return;
@@ -252,15 +348,22 @@ io.on("connection", (socket) => {
       socket.emit("errorMsg", `Waiting for: ${notReadyPlayers.join(', ')}`);
       return;
     }
+    
+    // Validate role settings one more time before starting
+    const validation = validateRoleSettings(game.roleSettings, playersList.length);
+    if (!validation.valid) {
+      socket.emit("errorMsg", validation.message);
+      return;
+    }
 
     console.log(`[Room ${rId}] 🎮 Starting game with ${playersList.length} players`);
     
     // Notify all players that game is starting
     io.to(rId).emit("gameStarting");
     
-    // Assign roles
+    // Assign roles using the custom settings
     const playerIds = Object.keys(game.players);
-    const roles = assignRoles(playerIds.length);
+    const roles = assignRoles(game, rId);
     
     playerIds.forEach((pid, idx) => {
       game.players[pid].role = roles[idx];
@@ -275,7 +378,7 @@ io.on("connection", (socket) => {
     game.votes = {};
     game.lastActive = Date.now();
 
-    // Send each player their role with a delay for dramatic effect
+    // Send each player their role
     playerIds.forEach((pid, index) => {
       setTimeout(() => {
         const playerSocket = io.sockets.sockets.get(game.players[pid].socketId);
@@ -292,7 +395,7 @@ io.on("connection", (socket) => {
             }
           });
         }
-      }, index * 200); // Stagger role reveals
+      }, index * 200);
     });
 
     // After 5 seconds, start the first night
@@ -316,7 +419,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Store night action
     if (!game.nightActions) game.nightActions = {};
     game.nightActions[playerId] = { actionType, targetId, timestamp: Date.now() };
     
@@ -357,7 +459,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Store vote
     if (!game.votes) game.votes = {};
     game.votes[playerId] = targetId;
     
@@ -365,10 +466,8 @@ io.on("connection", (socket) => {
     const targetName = game.players[targetId]?.name || "Unknown";
     console.log(`[Room ${rId}] ☀️ ${voterName} voted for ${targetName}`);
 
-    // Send vote update to all players
     io.to(rId).emit("voteUpdate", { votes: game.votes });
 
-    // Check if all alive players have voted
     const alivePlayers = Object.values(game.players).filter(p => p.alive);
     if (Object.keys(game.votes).length >= alivePlayers.length) {
       console.log(`[Room ${rId}] ☀️ All votes in, tallying...`);
@@ -389,13 +488,11 @@ io.on("connection", (socket) => {
     const playerName = game.players[playerId].name;
     const wasHost = game.hostId === playerId;
     
-    // Remove player
     delete game.players[playerId];
     socket.leave(rId);
     
     console.log(`[Room ${rId}] 🚪 ${playerName} left the lobby`);
 
-    // Handle host reassignment
     if (wasHost && Object.keys(game.players).length > 0) {
       const newHostId = Object.keys(game.players)[0];
       game.hostId = newHostId;
@@ -403,7 +500,6 @@ io.on("connection", (socket) => {
       console.log(`[Room ${rId}] 👑 New host is ${game.players[newHostId].name}`);
     }
 
-    // Clean up empty room
     if (Object.keys(game.players).length === 0) {
       delete games[rId];
       console.log(`[Room ${rId}] 🗑️ Room deleted (empty)`);
@@ -427,9 +523,7 @@ io.on("connection", (socket) => {
         console.log(`[Room ${roomId}] ⚠️ ${game.players[playerId].name} disconnected`);
         game.lastActive = Date.now();
         
-        // If game is in progress, mark player as disconnected but keep in game
         if (game.status === "playing") {
-          // Keep player in game for potential reconnection
           console.log(`[Room ${roomId}] ${game.players[playerId].name} remains in game (can reconnect)`);
         }
       }
@@ -446,7 +540,6 @@ io.on("connection", (socket) => {
       return callback?.({ success: false, message: "Cannot reconnect to room" });
     }
 
-    // Update socket ID
     game.players[playerId].socketId = socket.id;
     socket.join(rId);
     socket.data.roomId = rId;
@@ -456,7 +549,6 @@ io.on("connection", (socket) => {
     
     game.lastActive = Date.now();
     
-    // Send current game state to reconnecting player
     if (game.status === "playing") {
       socket.emit("gameStateUpdate", {
         phase: game.phase,
@@ -475,9 +567,7 @@ io.on("connection", (socket) => {
   function processNightActions(game, roomId) {
     const kills = new Set();
     const saves = new Set();
-    const investigations = [];
 
-    // Process each night action
     for (const [playerId, action] of Object.entries(game.nightActions)) {
       const actor = game.players[playerId];
       if (!actor || !actor.alive) continue;
@@ -491,7 +581,6 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Apply kills (unless saved by Doctor)
     let killedPlayers = [];
     kills.forEach(targetId => {
       if (!saves.has(targetId) && game.players[targetId] && game.players[targetId].alive) {
@@ -500,12 +589,10 @@ io.on("connection", (socket) => {
       }
     });
 
-    // Clear night actions
     game.nightActions = {};
     game.phase = "day";
     game.lastActive = Date.now();
 
-    // Send day begins event
     io.to(roomId).emit("dayBegins", { 
       duration: 90,
       players: game.players,
@@ -514,32 +601,26 @@ io.on("connection", (socket) => {
     
     console.log(`[Room ${roomId}] ☀️ Day phase begins. Killed tonight: ${killedPlayers.join(', ') || 'No one'}`);
 
-    // Check win conditions
     checkWinConditions(game, roomId);
   }
 
   function processDayVotes(game, roomId) {
-    // Tally votes
     const tally = {};
     Object.values(game.votes).forEach(targetId => {
       tally[targetId] = (tally[targetId] || 0) + 1;
     });
 
-    // Find player(s) with most votes
     const maxVotes = Math.max(...Object.values(tally));
     const eliminatedCandidates = Object.keys(tally).filter(pid => tally[pid] === maxVotes);
 
     let eliminatedPlayer = null;
     
     if (eliminatedCandidates.length === 1) {
-      // Clear winner
       eliminatedPlayer = eliminatedCandidates[0];
     } else if (eliminatedCandidates.length > 1) {
-      // Tie - no one gets eliminated
       console.log(`[Room ${roomId}] 🤝 Vote tie! No one eliminated.`);
     }
 
-    // Eliminate player if there's a clear winner
     if (eliminatedPlayer && game.players[eliminatedPlayer] && game.players[eliminatedPlayer].alive) {
       game.players[eliminatedPlayer].alive = false;
       const eliminatedName = game.players[eliminatedPlayer].name;
@@ -547,7 +628,6 @@ io.on("connection", (socket) => {
       
       console.log(`[Room ${roomId}] ☠️ ${eliminatedName} was eliminated (${eliminatedRole})`);
       
-      // Send elimination event
       io.to(roomId).emit("playerEliminated", {
         playerId: eliminatedPlayer,
         name: eliminatedName,
@@ -556,15 +636,12 @@ io.on("connection", (socket) => {
       });
     }
 
-    // Reset votes and switch to night
     game.votes = {};
     game.phase = "night";
     game.lastActive = Date.now();
 
-    // Check win conditions
     checkWinConditions(game, roomId);
 
-    // If game is still ongoing, start next night
     if (game.status === "playing") {
       setTimeout(() => {
         io.to(roomId).emit("nightBegins", { 
@@ -572,7 +649,7 @@ io.on("connection", (socket) => {
           players: game.players 
         });
         console.log(`[Room ${roomId}] 🌙 Next night begins`);
-      }, 3000); // 3 second delay before next night
+      }, 3000);
     }
   }
 });
@@ -581,21 +658,19 @@ io.on("connection", (socket) => {
 setInterval(() => {
   const now = Date.now();
   Object.entries(games).forEach(([roomId, game]) => {
-    // Clean up empty rooms
     if (!game.players || Object.keys(game.players).length === 0) {
       console.log(`🗑️ Cleaning up empty room: ${roomId}`);
       delete games[roomId];
       return;
     }
     
-    // Clean up inactive rooms (no activity for 5 minutes)
+    // FIXED: Changed ROLE_EXPIRY_MS to ROOM_EXPIRY_MS
     if (now - game.lastActive > ROOM_EXPIRY_MS) {
       console.log(`🗑️ Cleaning up inactive room: ${roomId}`);
       delete games[roomId];
       return;
     }
     
-    // Remove disconnected players who haven't reconnected in 2 minutes
     if (game.status === "waiting") {
       Object.entries(game.players).forEach(([playerId, player]) => {
         const socketExists = io.sockets.sockets.get(player.socketId);
@@ -603,7 +678,6 @@ setInterval(() => {
           console.log(`[Room ${roomId}] Removing disconnected player: ${player.name}`);
           delete game.players[playerId];
           
-          // If host left, assign new host
           if (game.hostId === playerId && Object.keys(game.players).length > 0) {
             game.hostId = Object.keys(game.players)[0];
             io.to(roomId).emit("hostAssigned", { hostId: game.hostId });
@@ -611,13 +685,12 @@ setInterval(() => {
         }
       });
       
-      // Update lobby if players were removed
       if (Object.keys(game.players).length > 0) {
         emitLobbyUpdate(roomId);
       }
     }
   });
-}, 30000); // Run every 30 seconds
+}, 30000);
 
 // ------------------ Start Server ------------------ //
 const PORT = process.env.PORT || 4000;
