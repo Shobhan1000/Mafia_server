@@ -108,6 +108,11 @@ io.on("connection", (socket) => {
     const game = games[rId];
 
     if (!game) return callback?.({ success: false, message: "Room not found" });
+    
+    // Check if game has players object
+    if (!game.players) {
+      game.players = {};
+    }
 
     game.players[pId] = {
       playerId: pId,
@@ -119,17 +124,22 @@ io.on("connection", (socket) => {
     };
     socket.join(rId);
 
+    // Ensure hostId exists, if not set the first player as host
+    if (!game.hostId && Object.keys(game.players).length > 0) {
+      game.hostId = Object.keys(game.players)[0];
+    }
+
     io.to(rId).emit("hostAssigned", { hostId: game.hostId });
     emitLobbyUpdate(rId);
 
-    callback?.({ success: true, playerId: pId });
+    callback?.({ success: true, playerId: pId, roomId: rId });
   });
 
   // --- Reconnect to Room ---
   socket.on("reconnectToRoom", ({ roomId, playerId }, callback) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || !game.players[playerId]) {
+    if (!game || !game.players || !game.players[playerId]) {
       return callback?.({ success: false, message: "Reconnection failed" });
     }
     game.players[playerId].socketId = socket.id;
@@ -142,7 +152,7 @@ io.on("connection", (socket) => {
   socket.on("playerReady", ({ roomId, playerId, ready }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || !game.players[playerId]) return;
+    if (!game || !game.players || !game.players[playerId]) return;
 
     game.players[playerId].ready = !!ready;
     console.log(`[Room ${rId}] ${game.players[playerId].name} is now ${ready ? "READY" : "NOT ready"}`);
@@ -188,41 +198,44 @@ io.on("connection", (socket) => {
   socket.on("leaveLobby", ({ roomId, playerId }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game) return;
+    if (!game || !game.players) return;
 
     const wasHost = game.hostId === playerId;
     delete game.players[playerId];
     socket.leave(rId);
 
-    if (wasHost) {
-      const remaining = Object.keys(game.players ?? {});
-      game.hostId = remaining.length ? remaining[0] : null;
-      if (game.hostId) io.to(rId).emit("hostAssigned", { hostId: game.hostId });
+    if (wasHost && Object.keys(game.players).length > 0) {
+      const remaining = Object.keys(game.players);
+      game.hostId = remaining[0];
+      io.to(rId).emit("hostAssigned", { hostId: game.hostId });
+    } else if (Object.keys(game.players).length === 0) {
+      // If no players left, clean up the room
+      delete games[rId];
+      return;
     }
 
-    if (Object.keys(game.players ?? {}).length === 0) {
-      game.lastActive = Date.now();
-    } else {
-      emitLobbyUpdate(rId);
-    }
+    emitLobbyUpdate(rId);
   });
 
   socket.on("disconnect", () => {
     console.log(`Client disconnected: ${socket.id}`);
     for (const [roomId, game] of Object.entries(games)) {
-      const player = Object.values(game.players).find(p => p.socketId === socket.id);
-      if (player) {
-        game.lastActive = Date.now();
+      for (const [playerId, player] of Object.entries(game.players || {})) {
+        if (player.socketId === socket.id) {
+          game.lastActive = Date.now();
+          break;
+        }
       }
     }
   });
 
-  // --- Night & Day Logic (unchanged except for playerId adaptation) ---
+  // --- Night & Day Logic ---
   socket.on("nightAction", ({ roomId, playerId, actionType, targetId }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || game.phase !== "night" || !game.players[playerId]) return;
+    if (!game || game.phase !== "night" || !game.players || !game.players[playerId]) return;
 
+    if (!game.nightActions) game.nightActions = {};
     game.nightActions[playerId] = { actionType, targetId };
     console.log(`[Room ${rId}] ${game.players[playerId].name} (${game.players[playerId].role}) targets ${targetId}`);
 
@@ -272,7 +285,7 @@ io.on("connection", (socket) => {
   socket.on("dayVote", ({ roomId, playerId, targetId }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || game.phase !== "day" || !game.players[playerId]) return;
+    if (!game || game.phase !== "day" || !game.players || !game.players[playerId]) return;
 
     if (!game.votes) game.votes = {};
     game.votes[playerId] = targetId;
@@ -306,10 +319,18 @@ io.on("connection", (socket) => {
 setInterval(() => {
   const now = Date.now();
   for (const [roomId, game] of Object.entries(games)) {
-    const allDisconnected = Object.values(game.players).every(p => !io.sockets.sockets.get(p.socketId));
-    if (allDisconnected && now - game.lastActive > ROOM_EXPIRY_MS) {
-      console.log(`Deleting inactive room ${roomId}`);
+    if (!game.players || Object.keys(game.players).length === 0) {
+      console.log(`Deleting empty room ${roomId}`);
       delete games[roomId];
+    } else if (now - game.lastActive > ROOM_EXPIRY_MS) {
+      const allDisconnected = Object.values(game.players).every(p => {
+        const socketExists = io.sockets.sockets.get(p.socketId);
+        return !socketExists;
+      });
+      if (allDisconnected) {
+        console.log(`Deleting inactive room ${roomId}`);
+        delete games[roomId];
+      }
     }
   }
 }, 30000);
