@@ -15,6 +15,11 @@ const io = new Server(server, {
 const games = {};
 const ROOM_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
 
+// Rate limiting for chat messages
+const chatRateLimits = {}; // { playerId: { count: number, resetTime: timestamp } }
+const CHAT_LIMIT = 5; // messages
+const CHAT_WINDOW = 10000; // 10 seconds
+
 // Role configuration with emojis
 const ROLE_CONFIG = {
   Mafia: {
@@ -50,6 +55,40 @@ const ROLE_CONFIG = {
 // ------------------ Helper Functions ------------------ //
 function safeRoomId(id) {
   return String(id || "").trim().toUpperCase();
+}
+
+function sanitizeMessage(message) {
+  if (!message) return "";
+  return String(message)
+    .trim()
+    .substring(0, 200) // Max 200 characters
+    .replace(/[<>]/g, '') // Remove potential XSS characters
+    .replace(/\s+/g, ' '); // Normalize whitespace
+}
+
+function checkChatRateLimit(playerId) {
+  const now = Date.now();
+  
+  if (!chatRateLimits[playerId]) {
+    chatRateLimits[playerId] = { count: 1, resetTime: now + CHAT_WINDOW };
+    return true;
+  }
+  
+  const limit = chatRateLimits[playerId];
+  
+  if (now > limit.resetTime) {
+    // Reset the counter
+    limit.count = 1;
+    limit.resetTime = now + CHAT_WINDOW;
+    return true;
+  }
+  
+  if (limit.count >= CHAT_LIMIT) {
+    return false; // Rate limit exceeded
+  }
+  
+  limit.count++;
+  return true;
 }
 
 function emitLobbyUpdate(roomId) {
@@ -157,7 +196,13 @@ function checkWinConditions(game, roomId) {
   }
   
   if (winner) {
-    // Prepare role reveal data
+    // Prepare final roles data
+    const finalRoles = {};
+    Object.entries(game.players).forEach(([playerId, player]) => {
+      finalRoles[playerId] = player.role;
+    });
+    
+    // Prepare role reveal data (more detailed)
     const roleReveal = {};
     Object.values(game.players).forEach(player => {
       roleReveal[player.playerId] = {
@@ -167,8 +212,11 @@ function checkWinConditions(game, roomId) {
       };
     });
     
-    // Send game over and role reveal
-    io.to(roomId).emit("gameOver", { winner });
+    // Send game over with final roles and detailed reveal
+    io.to(roomId).emit("gameOver", { 
+      winner,
+      finalRoles // NEW: Send final roles for frontend
+    });
     io.to(roomId).emit("revealRoles", { roles: roleReveal });
     
     game.status = "finished";
@@ -259,6 +307,120 @@ io.on("connection", (socket) => {
 
     // Broadcast updated lobby state
     emitLobbyUpdate(rId);
+  });
+
+  // --- LOBBY CHAT MESSAGE (NEW) ---
+  socket.on("lobbyChatMessage", ({ roomId, playerId, message }) => {
+    const rId = safeRoomId(roomId);
+    const game = games[rId];
+    
+    if (!game || !game.players[playerId]) {
+      console.log(`[Room ${rId}] ❌ Invalid lobby chat from ${playerId}`);
+      return;
+    }
+    
+    // Check rate limit
+    if (!checkChatRateLimit(playerId)) {
+      socket.emit("errorMsg", "You're sending messages too quickly. Please slow down.");
+      return;
+    }
+    
+    const sanitizedMessage = sanitizeMessage(message);
+    if (!sanitizedMessage) return;
+    
+    const player = game.players[playerId];
+    console.log(`[Room ${rId}] 💬 ${player.name}: ${sanitizedMessage}`);
+    
+    // Broadcast to all players in lobby
+    io.to(rId).emit("lobbyChatMessage", {
+      playerId,
+      name: player.name,
+      message: sanitizedMessage,
+      timestamp: Date.now()
+    });
+  });
+
+  // --- DAY CHAT MESSAGE (NEW) ---
+  socket.on("dayChatMessage", ({ roomId, playerId, message }) => {
+    const rId = safeRoomId(roomId);
+    const game = games[rId];
+    
+    if (!game || game.phase !== "day" || !game.players[playerId]) {
+      console.log(`[Room ${rId}] ❌ Invalid day chat from ${playerId}`);
+      return;
+    }
+    
+    const player = game.players[playerId];
+    
+    // Only alive players can chat during day
+    if (!player.alive) {
+      socket.emit("errorMsg", "Dead players cannot chat.");
+      return;
+    }
+    
+    // Check rate limit
+    if (!checkChatRateLimit(playerId)) {
+      socket.emit("errorMsg", "You're sending messages too quickly. Please slow down.");
+      return;
+    }
+    
+    const sanitizedMessage = sanitizeMessage(message);
+    if (!sanitizedMessage) return;
+    
+    console.log(`[Room ${rId}] ☀️ ${player.name}: ${sanitizedMessage}`);
+    
+    // Broadcast to all players in room
+    io.to(rId).emit("dayChatMessage", {
+      playerId,
+      name: player.name,
+      message: sanitizedMessage,
+      timestamp: Date.now()
+    });
+  });
+
+  // --- MAFIA CHAT MESSAGE (NEW) ---
+  socket.on("mafiaChatMessage", ({ roomId, playerId, message }) => {
+    const rId = safeRoomId(roomId);
+    const game = games[rId];
+    
+    if (!game || game.phase !== "night" || !game.players[playerId]) {
+      console.log(`[Room ${rId}] ❌ Invalid mafia chat from ${playerId}`);
+      return;
+    }
+    
+    const player = game.players[playerId];
+    
+    // Only Mafia members can use Mafia chat
+    if (player.role !== "Mafia" || !player.alive) {
+      console.log(`[Room ${rId}] ❌ Non-Mafia player ${player.name} tried to use Mafia chat`);
+      return;
+    }
+    
+    // Check rate limit
+    if (!checkChatRateLimit(playerId)) {
+      socket.emit("errorMsg", "You're sending messages too quickly. Please slow down.");
+      return;
+    }
+    
+    const sanitizedMessage = sanitizeMessage(message);
+    if (!sanitizedMessage) return;
+    
+    console.log(`[Room ${rId}] 🕶️ [MAFIA] ${player.name}: ${sanitizedMessage}`);
+    
+    // Broadcast ONLY to Mafia members
+    Object.values(game.players).forEach(p => {
+      if (p.role === "Mafia" && p.alive) {
+        const mafiaSocket = io.sockets.sockets.get(p.socketId);
+        if (mafiaSocket) {
+          mafiaSocket.emit("mafiaChatMessage", {
+            playerId,
+            name: player.name,
+            message: sanitizedMessage,
+            timestamp: Date.now()
+          });
+        }
+      }
+    });
   });
 
   // --- UPDATE ROLE SETTINGS (HOST ONLY) ---
@@ -371,6 +533,14 @@ io.on("connection", (socket) => {
       console.log(`[Room ${rId}] ${game.players[pid].name} → ${game.players[pid].role}`);
     });
 
+    // Get list of Mafia members (NEW - for team coordination)
+    const mafiaMembers = Object.values(game.players)
+      .filter(p => p.role === "Mafia")
+      .map(p => ({
+        playerId: p.playerId,
+        name: p.name
+      }));
+
     // Update game state
     game.status = "playing";
     game.phase = "roleReveal";
@@ -378,7 +548,7 @@ io.on("connection", (socket) => {
     game.votes = {};
     game.lastActive = Date.now();
 
-    // Send each player their role
+    // Send each player their role (ENHANCED - includes Mafia team members)
     playerIds.forEach((pid, index) => {
       setTimeout(() => {
         const playerSocket = io.sockets.sockets.get(game.players[pid].socketId);
@@ -386,14 +556,22 @@ io.on("connection", (socket) => {
           const role = game.players[pid].role;
           const roleConfig = ROLE_CONFIG[role] || ROLE_CONFIG.Villager;
           
-          playerSocket.emit("roleAssigned", {
+          // NEW: Include Mafia team members for Mafia players
+          const roleData = {
             roomId: rId,
             role: role,
             roleData: {
               ...roleConfig,
               name: game.players[pid].name
             }
-          });
+          };
+          
+          // Add Mafia team members if player is Mafia
+          if (role === "Mafia") {
+            roleData.mafiaMembers = mafiaMembers;
+          }
+          
+          playerSocket.emit("roleAssigned", roleData);
         }
       }, index * 200);
     });
@@ -409,7 +587,7 @@ io.on("connection", (socket) => {
     }, 5000);
   });
 
-  // --- NIGHT ACTION ---
+  // --- NIGHT ACTION (ENHANCED - with confirmation) ---
   socket.on("nightAction", ({ roomId, playerId, actionType, targetId }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
@@ -420,11 +598,21 @@ io.on("connection", (socket) => {
     }
 
     if (!game.nightActions) game.nightActions = {};
+    
+    // Check if player already submitted an action
+    if (game.nightActions[playerId]) {
+      socket.emit("errorMsg", "You've already submitted your action for this night.");
+      return;
+    }
+    
     game.nightActions[playerId] = { actionType, targetId, timestamp: Date.now() };
     
     const playerName = game.players[playerId].name;
     const targetName = game.players[targetId]?.name || "Unknown";
     console.log(`[Room ${rId}] 🌙 ${playerName} (${game.players[playerId].role}) → ${actionType} → ${targetName}`);
+
+    // NEW: Send immediate confirmation to player
+    socket.emit("actionConfirmed", { actionType });
 
     // If player is Detective, send investigation result immediately
     if (game.players[playerId].role === "Detective" && actionType === "investigate") {
@@ -466,7 +654,13 @@ io.on("connection", (socket) => {
     const targetName = game.players[targetId]?.name || "Unknown";
     console.log(`[Room ${rId}] ☀️ ${voterName} voted for ${targetName}`);
 
-    io.to(rId).emit("voteUpdate", { votes: game.votes });
+    // Count votes for each player
+    const voteCounts = {};
+    Object.values(game.votes).forEach(tId => {
+      voteCounts[tId] = (voteCounts[tId] || 0) + 1;
+    });
+
+    io.to(rId).emit("voteUpdate", { votes: voteCounts });
 
     const alivePlayers = Object.values(game.players).filter(p => p.alive);
     if (Object.keys(game.votes).length >= alivePlayers.length) {
@@ -586,6 +780,13 @@ io.on("connection", (socket) => {
       if (!saves.has(targetId) && game.players[targetId] && game.players[targetId].alive) {
         game.players[targetId].alive = false;
         killedPlayers.push(game.players[targetId].name);
+        
+        // Emit individual elimination event
+        io.to(roomId).emit("playerEliminated", {
+          playerId: targetId,
+          name: game.players[targetId].name,
+          role: game.players[targetId].role
+        });
       }
     });
 
@@ -664,7 +865,6 @@ setInterval(() => {
       return;
     }
     
-    // FIXED: Changed ROLE_EXPIRY_MS to ROOM_EXPIRY_MS
     if (now - game.lastActive > ROOM_EXPIRY_MS) {
       console.log(`🗑️ Cleaning up inactive room: ${roomId}`);
       delete games[roomId];
@@ -692,9 +892,20 @@ setInterval(() => {
   });
 }, 30000);
 
+// --- Cleanup rate limits periodically ---
+setInterval(() => {
+  const now = Date.now();
+  Object.entries(chatRateLimits).forEach(([playerId, limit]) => {
+    if (now > limit.resetTime + 60000) { // Clean up after 1 minute of inactivity
+      delete chatRateLimits[playerId];
+    }
+  });
+}, 60000);
+
 // ------------------ Start Server ------------------ //
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 Socket.IO server ready`);
+  console.log(`🎮 Mafia game server initialized with enhanced features`);
 });
