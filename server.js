@@ -5,10 +5,15 @@ const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, { 
+  cors: { 
+    origin: "*",
+    methods: ["GET", "POST"]
+  } 
+});
 
-const games = {}; // { roomId: { players: { playerId: {...} }, hostId, ... } }
-const ROOM_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const games = {};
+const ROOM_EXPIRY_MS = 5 * 60 * 1000;
 
 // ------------------ Helper Functions ------------------ //
 function assignRoles(playerCount) {
@@ -54,10 +59,25 @@ function safeRoomId(id) {
 function emitLobbyUpdate(roomId) {
   const game = games[roomId];
   if (!game) return;
+  
+  // Clean up any players with duplicate socket IDs
+  const players = {};
+  const seenSocketIds = new Set();
+  
+  Object.values(game.players).forEach(player => {
+    if (player && player.playerId && !seenSocketIds.has(player.socketId)) {
+      seenSocketIds.add(player.socketId);
+      players[player.playerId] = player;
+    }
+  });
+  
+  game.players = players;
+  
   io.to(roomId).emit("lobbyUpdate", {
     players: game.players,
     hostId: game.hostId
   });
+  console.log(`[Room ${roomId}] Lobby update sent to ${Object.keys(game.players).length} players`);
 }
 
 // ------------------ Socket.IO Logic ------------------ //
@@ -84,17 +104,39 @@ io.on("connection", (socket) => {
       console.log(`[Room ${rId}] created by ${pName} (${pId})`);
     }
 
-    games[rId].players[pId] = {
-      playerId: pId,
-      socketId: socket.id,
-      name: pName,
-      role: null,
-      alive: true,
-      ready: false
-    };
+    const game = games[rId];
+    
+    // Check if player already exists (by playerId or socketId)
+    let existingPlayerId = null;
+    Object.entries(game.players).forEach(([pid, player]) => {
+      if (player.socketId === socket.id || pid === pId) {
+        existingPlayerId = pid;
+      }
+    });
+    
+    if (existingPlayerId) {
+      // Update existing player
+      game.players[existingPlayerId].socketId = socket.id;
+      game.players[existingPlayerId].name = pName;
+      game.players[existingPlayerId].ready = game.players[existingPlayerId].ready || false;
+      console.log(`[Room ${rId}] Existing player ${pName} reconnected`);
+    } else {
+      // Add new player
+      game.players[pId] = {
+        playerId: pId,
+        socketId: socket.id,
+        name: pName,
+        role: null,
+        alive: true,
+        ready: false
+      };
+      console.log(`[Room ${rId}] New player ${pName} joined`);
+    }
+    
     socket.join(rId);
+    game.lastActive = Date.now();
 
-    io.to(rId).emit("hostAssigned", { hostId: games[rId].hostId });
+    io.to(rId).emit("hostAssigned", { hostId: game.hostId });
     emitLobbyUpdate(rId);
 
     callback?.({ success: true, playerId: pId, roomId: rId });
@@ -109,22 +151,37 @@ io.on("connection", (socket) => {
 
     if (!game) return callback?.({ success: false, message: "Room not found" });
     
-    // Check if game has players object
-    if (!game.players) {
-      game.players = {};
+    // Check if player already exists
+    let existingPlayerId = null;
+    Object.entries(game.players).forEach(([pid, player]) => {
+      if (player.socketId === socket.id || pid === pId) {
+        existingPlayerId = pid;
+      }
+    });
+    
+    if (existingPlayerId) {
+      // Update existing player
+      game.players[existingPlayerId].socketId = socket.id;
+      game.players[existingPlayerId].name = pName;
+      game.players[existingPlayerId].ready = game.players[existingPlayerId].ready || false;
+      console.log(`[Room ${rId}] Existing player ${pName} reconnected (join)`);
+    } else {
+      // Add new player
+      game.players[pId] = {
+        playerId: pId,
+        socketId: socket.id,
+        name: pName,
+        role: null,
+        alive: true,
+        ready: false
+      };
+      console.log(`[Room ${rId}] New player ${pName} joined (join)`);
     }
-
-    game.players[pId] = {
-      playerId: pId,
-      socketId: socket.id,
-      name: pName,
-      role: null,
-      alive: true,
-      ready: false
-    };
+    
     socket.join(rId);
+    game.lastActive = Date.now();
 
-    // Ensure hostId exists, if not set the first player as host
+    // Ensure hostId exists
     if (!game.hostId && Object.keys(game.players).length > 0) {
       game.hostId = Object.keys(game.players)[0];
     }
@@ -132,18 +189,24 @@ io.on("connection", (socket) => {
     io.to(rId).emit("hostAssigned", { hostId: game.hostId });
     emitLobbyUpdate(rId);
 
-    callback?.({ success: true, playerId: pId, roomId: rId });
+    callback?.({ success: true, playerId: existingPlayerId || pId, roomId: rId });
   });
 
   // --- Reconnect to Room ---
   socket.on("reconnectToRoom", ({ roomId, playerId }, callback) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || !game.players || !game.players[playerId]) {
+    if (!game || !game.players[playerId]) {
       return callback?.({ success: false, message: "Reconnection failed" });
     }
+    
+    // Update socket ID for reconnecting player
     game.players[playerId].socketId = socket.id;
     socket.join(rId);
+    game.lastActive = Date.now();
+    
+    console.log(`[Room ${rId}] Player ${game.players[playerId].name} reconnected`);
+    
     emitLobbyUpdate(rId);
     callback?.({ success: true });
   });
@@ -152,10 +215,16 @@ io.on("connection", (socket) => {
   socket.on("playerReady", ({ roomId, playerId, ready }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
-    if (!game || !game.players || !game.players[playerId]) return;
+    if (!game || !game.players[playerId]) return;
 
-    game.players[playerId].ready = !!ready;
+    game.players[playerId].ready = Boolean(ready);
+    game.lastActive = Date.now();
+    
     console.log(`[Room ${rId}] ${game.players[playerId].name} is now ${ready ? "READY" : "NOT ready"}`);
+    console.log(`[Room ${rId}] All players ready status:`, 
+      Object.values(game.players).map(p => `${p.name}: ${p.ready ? 'ready' : 'not ready'}`)
+    );
+    
     emitLobbyUpdate(rId);
   });
 
@@ -172,7 +241,7 @@ io.on("connection", (socket) => {
 
     if (!allReady) return socket.emit("errorMsg", `Need at least ${minPlayers} players and everyone ready`);
 
-    console.log(`[Room ${rId}] Game started`);
+    console.log(`[Room ${rId}] Game started with ${playersList.length} players`);
 
     const ids = Object.keys(game.players);
     const roles = assignRoles(ids.length);
@@ -194,26 +263,34 @@ io.on("connection", (socket) => {
     io.to(rId).emit("nightBegins");
   });
 
-  // --- Leave Lobby / Disconnect Handling ---
+  // --- Leave Lobby ---
   socket.on("leaveLobby", ({ roomId, playerId }) => {
     const rId = safeRoomId(roomId);
     const game = games[rId];
     if (!game || !game.players) return;
 
+    const player = game.players[playerId];
     const wasHost = game.hostId === playerId;
-    delete game.players[playerId];
-    socket.leave(rId);
+    
+    if (player) {
+      console.log(`[Room ${rId}] ${player.name} left the lobby`);
+      delete game.players[playerId];
+      socket.leave(rId);
+    }
 
     if (wasHost && Object.keys(game.players).length > 0) {
       const remaining = Object.keys(game.players);
       game.hostId = remaining[0];
       io.to(rId).emit("hostAssigned", { hostId: game.hostId });
+      console.log(`[Room ${rId}] New host is ${game.players[game.hostId].name}`);
     } else if (Object.keys(game.players).length === 0) {
       // If no players left, clean up the room
+      console.log(`[Room ${rId}] Room empty, deleting`);
       delete games[rId];
       return;
     }
 
+    game.lastActive = Date.now();
     emitLobbyUpdate(rId);
   });
 
@@ -222,6 +299,7 @@ io.on("connection", (socket) => {
     for (const [roomId, game] of Object.entries(games)) {
       for (const [playerId, player] of Object.entries(game.players || {})) {
         if (player.socketId === socket.id) {
+          console.log(`[Room ${roomId}] Marking ${player.name} as disconnected`);
           game.lastActive = Date.now();
           break;
         }
